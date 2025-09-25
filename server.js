@@ -1,36 +1,31 @@
 const express = require('express');
 const axios = require('axios');
-require('dotenv').config();
 const app = express();
-
+ 
 app.use(express.json());
-
-// Salesforce config from env
+ 
+// ⚠️ UPDATE THESE WITH YOUR ACTUAL VALUES
 const SALESFORCE_CONFIG = {
-  clientId: process.env.SALESFORCE_CLIENT_ID,
-  clientSecret: process.env.SALESFORCE_CLIENT_SECRET,
-  username: process.env.SALESFORCE_USERNAME,
-  password: process.env.SALESFORCE_PASSWORD,
+  clientId: '3MVG9zV9CSFNbVbM4B6RB6otu_YPDrPdJzVkzDmK9i7m.5Xz3iIcVbQvHIng_YWJiQ9x_eJNcER8YLGxfrWfp',
+  clientSecret: 'C01AA6D513645CB0D9B4541D21114436C4ED27320BC68A29FF2D43E5D4A3B17F',
+  username: 'zoximaadmin@zoxima.com.services',
+  password: 'Zoxima@2018rSrWaqmuSUHaewd3b7HuTSR7',
   tokenUrl: 'https://test.salesforce.com/services/oauth2/token',
-  instanceUrl: process.env.SALESFORCE_INSTANCE_URL
+  instanceUrl: 'https://d1u0000013cp9uae--services.sandbox.my.salesforce.com'
 };
-
+ 
 let accessToken = null;
-
-// Get Salesforce access token
+ 
+// --- Get Salesforce access token ---
 async function getSalesforceToken() {
   try {
-    const response = await axios.post(
-      SALESFORCE_CONFIG.tokenUrl,
-      new URLSearchParams({
-        grant_type: 'password',
-        client_id: SALESFORCE_CONFIG.clientId,
-        client_secret: SALESFORCE_CONFIG.clientSecret,
-        username: SALESFORCE_CONFIG.username,
-        password: SALESFORCE_CONFIG.password
-      })
-    );
-
+    const response = await axios.post(SALESFORCE_CONFIG.tokenUrl, new URLSearchParams({
+      grant_type: 'password',
+      client_id: SALESFORCE_CONFIG.clientId,
+      client_secret: SALESFORCE_CONFIG.clientSecret,
+      username: SALESFORCE_CONFIG.username,
+      password: SALESFORCE_CONFIG.password
+    }));
     accessToken = response.data.access_token;
     console.log('✅ Salesforce token obtained');
     return response.data;
@@ -39,199 +34,146 @@ async function getSalesforceToken() {
     throw error;
   }
 }
-
-/**
- * Robust issue/subject extractor:
- * - Prefer explicit vapiData.issue if present
- * - Otherwise mine transcript for common patterns
- * - Fall back to concise phrase extraction
- * - Final clamp for clean Case.Subject / Phone_Call__c.Name
- */
-function extractIssue(vapiData) {
-  // 1) Prefer explicit issue field if tool sends it
-  const explicit =
-    vapiData && typeof vapiData.issue === 'string'
-      ? vapiData.issue.trim()
-      : '';
-  if (explicit) return clampSubject(explicit);
-
-  // 2) Use transcript (string or nested)
-  const transcript =
-    typeof vapiData?.transcript === 'string'
-      ? vapiData.transcript
-      : typeof vapiData?.transcript?.text === 'string'
-      ? vapiData.transcript.text
-      : '';
-
-  const text = (transcript || '').replace(/\s+/g, ' ').trim();
-  if (!text) return 'Support request';
-
-  // 3) Pattern-based candidates
-  const candidates = [];
-  const patterns = [
-    /\bissue\s*(?:is|:)\s*([^.!?\n\r]+)/i,
-    /\bproblem\s*(?:is|:)\s*([^.!?\n\r]+)/i,
-    /\berror\s*(?:is|:)\s*([^.!?\n\r]+)/i,
-    /\bgetting\s+(?:an?\s+)?error\s*([^.!?\n\r]*)/i,
-    /\bi\s*can(?:\'t|not)\s+([^.!?\n\r]+)/i,
-    /\bunable\s+to\s+([^.!?\n\r]+)/i,
-    /\bi\s*am\s*facing\s+([^.!?\n\r]+)/i,
-    /\bi\s*am\s*having\s+([^.!?\n\r]+)/i,
-    /\bi\s*have\s+([^.!?\n\r]+)/i,
-    /\bthere\s+is\s+([^.!?\n\r]+)/i,
-    /\b((?:low|high|poor|slow|failed|failing|broken|missing|invalid|expired)\s+[a-z][a-z\s]{2,})\b/i
-  ];
-
-  for (const p of patterns) {
-    const m = text.match(p);
-    if (m) {
-      const captured = (m[m.length - 1] || '').trim();
-      if (captured) candidates.push(captured);
-    }
-  }
-
-  if (candidates.length) {
-    const best = pickBestCandidate(candidates);
-    return clampSubject(best);
-  }
-
-  // 4) Fallback concise noun-phrase extraction
-  const fallback = conciseSubjectFromSentence(text);
-  if (fallback) return clampSubject(fallback);
-
-  // 5) Minimal neutral
-  return 'Support request';
+ 
+// --- Helper: Find Account by Phone ---
+async function findAccountByPhone(phoneNumber) {
+  const query = `SELECT Id, Name, AccountNumber FROM Account WHERE Phone = '${phoneNumber}' LIMIT 1`;
+  const response = await axios.get(
+    `${SALESFORCE_CONFIG.instanceUrl}/services/data/v58.0/query?q=${encodeURIComponent(query)}`,
+    { headers: { 'Authorization': `Bearer ${accessToken}` } }
+  );
+  return response.data.records[0] || null;
 }
-
-// Keep subject short, single-line, safe for SFDC Subject/Name fields
-function clampSubject(s) {
-  return s
-    .replace(/["'`]/g, '')
-    .replace(/\s+/g, ' ')
-    .replace(/^[,:;\-\s]+|[,:;\-\s]+$/g, '')
-    .slice(0, 120)
-    .trim();
+ 
+// --- Helper: Create Phone Call ---
+async function createPhoneCall(accountId, data) {
+  const payload = {
+    Account__c: accountId,
+    Name: data.subject || 'Phone Call',
+    Description__c: data.description || '',
+    Service_Call_Type__c: data.serviceCallType || '',
+    Issue_Category__c: data.issueCategory || '',
+    Call_Status__c: 'Open'
+  };
+ 
+  const response = await axios.post(
+    `${SALESFORCE_CONFIG.instanceUrl}/services/data/v58.0/sobjects/Phone_Call__c/`,
+    payload,
+    { headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+  );
+ 
+  return response.data.id;
 }
-
-// Choose the best candidate via simple heuristics
-function pickBestCandidate(arr) {
-  const keywords = [
-    'login',
-    'power',
-    'generation',
-    'payment',
-    'otp',
-    'reset',
-    'error',
-    'timeout',
-    'latency',
-    'crash',
-    'fail',
-    'unable',
-    'cannot',
-    'blocked',
-    'verification',
-    'invoice',
-    'delivery'
-  ];
-  const scored = arr.map((s) => {
-    const ls = s.toLowerCase();
-    const hits = keywords.reduce((acc, k) => acc + (ls.includes(k) ? 1 : 0), 0);
-    const lenPenalty = Math.max(0, Math.ceil((ls.length - 80) / 20));
-    return { s, score: hits - lenPenalty };
-  });
-  scored.sort((a, b) => b.score - a.score);
-  return scored[0].s;
+ 
+// --- Helper: Update Phone Call Status ---
+async function updatePhoneCallStatus(phoneCallId, status) {
+  await axios.patch(
+    `${SALESFORCE_CONFIG.instanceUrl}/services/data/v58.0/sobjects/Phone_Call__c/${phoneCallId}`,
+    { Call_Status__c: status },
+    { headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+  );
 }
-
-// Lightweight noun-phrase fallback
-function conciseSubjectFromSentence(text) {
-  let t = text
-    .replace(/^(hi|hello|hey|good\s+(morning|evening|afternoon))[,!\s]*/i, '')
-    .replace(/\bi\s*(am|m|have|had|was|were)\b/gi, '')
-    .replace(/\b(please|kindly|help|assist)\b/gi, '')
-    .trim();
-
-  const cues = ['about', 'regarding', 'related to', 'facing', 'having', 'with', 'on'];
-  for (const c of cues) {
-    const idx = t.toLowerCase().indexOf(c + ' ');
-    if (idx !== -1) {
-      t = t.slice(idx + c.length + 1).trim();
-      break;
-    }
-  }
-
-  t = t.replace(/\b(thank you|thanks|please|can you|could you|help me).*/i, '').trim();
-
-  const m = t.match(/^([^.!?\n\r]{3,120})/);
-  return m ? m[1].trim() : '';
+ 
+// --- Helper: Create Case ---
+async function createCase(accountId, phoneCallId, data) {
+  const payload = {
+    AccountId: accountId,
+    Phone_Call__c: phoneCallId,
+    Subject: data.subject || 'Customer Issue',
+    Description: data.description || '',
+    Service_Call_Type__c: data.serviceCallType || '',
+    Issue_Category__c: data.issueCategory || '',
+    Status: 'New',
+    Origin: 'Phone'
+  };
+ 
+  const response = await axios.post(
+    `${SALESFORCE_CONFIG.instanceUrl}/services/data/v58.0/sobjects/Case/`,
+    payload,
+    { headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+  );
+ 
+  return response.data.id;
 }
-
-// Main webhook endpoint
+ 
+// --- Helper: Create Service Activity ---
+async function createServiceActivity(accountId, caseId, phoneCallId, preferredDatetime, data) {
+  const payload = {
+    Customer_Name__c: accountId,
+    Case__c: caseId,
+    Subject__c: data.subject || 'Service Activity',
+    Start_Time__c: preferredDatetime,
+    Status__c: 'Scheduled',
+    Service_Call_Type__c: data.serviceCallType || '',
+    Machine_Installed__c: data.machineId || null,
+    Phone_Call__c: phoneCallId
+  };
+ 
+  const response = await axios.post(
+    `${SALESFORCE_CONFIG.instanceUrl}/services/data/v58.0/sobjects/Service_Activity__c/`,
+    payload,
+    { headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+  );
+ 
+  return response.data.id;
+}
+ 
+// --- Main Webhook ---
 app.post('/vapi-webhook', async (req, res) => {
   try {
     console.log('📞 Received webhook');
-
-    // Only process end-of-call reports (or accept tool posts that mimic it)
-    if (req.body.type && req.body.type !== 'end-of-call-report') {
+    if (req.body.type !== 'end-of-call-report') {
       return res.json({ success: true });
     }
-
-    // Ensure token
+ 
     if (!accessToken) {
       await getSalesforceToken();
     }
-
-    // Extract issue/subject
-    const issue = extractIssue(req.body);
-    console.log('📝 Subject:', issue);
-
-    // 1) Create Case with Subject
-    const caseResponse = await axios.post(
-      `${SALESFORCE_CONFIG.instanceUrl}/services/data/v58.0/sobjects/Case/`,
-      { Subject: issue },
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    // 2) Create Phone Call with Name
-    const phoneCallResponse = await axios.post(
-      `${SALESFORCE_CONFIG.instanceUrl}/services/data/v58.0/sobjects/Phone_Call__c/`,
-      { Name: issue },
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    console.log(`✅ Case: ${caseResponse.data.id}`);
-    console.log(`✅ Phone Call: ${phoneCallResponse.data.id}`);
-
-    res.json({
-      success: true,
-      caseId: caseResponse.data.id,
-      phoneCallId: phoneCallResponse.data.id
-    });
+ 
+    const {
+      phoneNumber, subject, description, serviceCallType,
+      issueCategory, resolutionStatus, createServiceActivity,
+      preferredDatetime, machineId
+    } = req.body;
+ 
+    // Step 1: Find Account by phone
+    const account = await findAccountByPhone(phoneNumber);
+    if (!account) {
+      return res.status(404).json({ success: false, message: 'Account not found' });
+    }
+ 
+    // Step 2: Create Phone Call
+    const phoneCallId = await createPhoneCall(account.Id, { subject, description, serviceCallType, issueCategory });
+ 
+    // Step 3: Troubleshoot resolution
+    if (resolutionStatus === 'resolved') {
+      await updatePhoneCallStatus(phoneCallId, 'Resolved');
+      return res.json({ success: true, phoneCallId, message: 'Issue resolved, call closed' });
+    }
+ 
+    // Step 4: If not resolved, create Case
+    const caseId = await createCase(account.Id, phoneCallId, { subject, description, serviceCallType, issueCategory });
+ 
+    // Step 5: Optional Service Activity
+    let serviceActivityId = null;
+    if (createServiceActivity === true && preferredDatetime) {
+      serviceActivityId = await createServiceActivity(account.Id, caseId, phoneCallId, preferredDatetime, { subject, serviceCallType, machineId });
+    }
+ 
+    res.json({ success: true, phoneCallId, caseId, serviceActivityId });
   } catch (error) {
     console.error('❌ Error:', error.response?.data || error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
+ 
 // Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'Running' });
-});
-
+app.get('/health', (req, res) => res.json({ status: 'Running' }));
+ 
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   getSalesforceToken().catch(console.error);
 });
+ 
